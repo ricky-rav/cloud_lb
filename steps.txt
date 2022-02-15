@@ -1,0 +1,81 @@
+## kubernetes images used in this:
+## openshift 4.9 (kubernetes 1.22) + debug lines: https://github.com/openshift/kubernetes/pull/1177
+## openshift 4.10 (kubernetes 1.23) + debug lines + modified logic in node cache updates: https://github.com/openshift/kubernetes/pull/1174
+
+## BZ link
+## https://bugzilla.redhat.com/show_bug.cgi?id=2040715
+
+
+## look at the node names
+$ kubectl get nodes
+NAME                                                STATUS   ROLES    AGE   VERSION
+ci-ln-3qh25qk-1d09d-5m9q8-master-0                  Ready    master   22m   v1.22.3+2cb6068
+ci-ln-3qh25qk-1d09d-5m9q8-master-1                  Ready    master   22m   v1.22.3+2cb6068
+ci-ln-3qh25qk-1d09d-5m9q8-master-2                  Ready    master   22m   v1.22.3+2cb6068
+ci-ln-3qh25qk-1d09d-5m9q8-worker-centralus2-zg6hc   Ready    worker   10m   v1.22.3+2cb6068
+ci-ln-3qh25qk-1d09d-5m9q8-worker-centralus3-8gvj9   Ready    worker   11m   v1.22.3+2cb6068
+
+## the cluster name for AZ is the root name of nodes seen above
+$ export CLUSTER=ci-ln-3qh25qk-1d09d-5m9q8
+
+## create backend server (two pods)
+$ kubectl apply -f server.yaml
+deployment.apps/hello-dep1 created
+
+## create load balancer
+$ kubectl apply -f service-lb.yaml
+service/hello1 created
+
+## see where the server pods are running
+$ kubectl get pods -o wide
+NAME                          READY   STATUS    RESTARTS   AGE
+hello-dep1-5866c8558f-qc7x9   1/1     Running   0          11m
+hello-dep1-5866c8558f-rss9r   1/1     Running   0          11m
+
+## note the external IP...
+$ kubectl get svc -w
+NAME         TYPE           CLUSTER-IP       EXTERNAL-IP                            PORT(S)        AGE
+hello1       LoadBalancer   172.30.130.159   52.230.216.80                          80:32044/TCP   17s
+kubernetes   ClusterIP      172.30.0.1       <none>                                 443/TCP        30m
+openshift    ExternalName   <none>           kubernetes.default.svc.cluster.local   <none>         19m
+
+## curl the (cloud-provided) external IP
+$ curl 52.230.216.80
+NOW: 2022-02-11 14:28:50.789022265 +0000 UTC m=+140.980251690
+
+## inspect AZ LB
+$ az network lb list -g ${CLUSTER}-rg  | jq > t0_az_network_lb.json
+...
+
+
+## save kube controller manager logs
+$ kubectl get pods -A -o wide | grep kube-controller-manager 
+ [...]
+$ kubectl logs kube-controller-manager-ci-ln-8f7c2jk-1d09d-svprg-master-2 -n openshift-kube-controller-manager
+
+### TRY EXCLUSION BY LABEL
+# add label to a node
+$ kubectl label nodes ci-ln-8f7c2jk-1d09d-svprg-worker-centralus3-82ck2 "node.kubernetes.io/exclude-from-external-load-balancers"=""
+
+# show current labels
+$ kubectl get nodes ci-ln-8f7c2jk-1d09d-svprg-worker-centralus3-82ck2 -o jsonpath='{.metadata.labels}' | jq
+
+# verify that cloud controller manager reacts to this
+$ kubectl logs kube-controller-manager-ci-ln-8f7c2jk-1d09d-svprg-master-2 -n openshift-kube-controller-manager
+# in particular look for this line, which is printed when the code detects a node that needs to be deleted:
+# I0211 14:38:44.651083       1 azure_loadbalancer.go:1142] reconcileLoadBalancer for service (openshift-ingress/router-default)(true): lb backendpool - found unwanted node ci-ln-3qh25qk-1d09d-5m9q8-worker-centralus2-zg6hc, decouple it from the LB
+
+
+# see if anything changed on AZ LB...
+$ az network lb list -g ${CLUSTER}-rg  | jq> t1_az_network_lb.json
+
+$ diff -uB t0_az_network_lb.json t1_az_network_lb.json
+
+# you should see that in the second file the deleted node does not appear (a whole block of ~10 lines should be missing)
+
+
+### TRY EXCLUSION BY KUBELET FAILURE (REBOOT)
+## apply machine config!
+kubectl apply -f 1-worker-testfile.yaml
+
+## repeat the steps above
